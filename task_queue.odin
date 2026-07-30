@@ -309,6 +309,23 @@ terminal_state :: proc(state: Task_State) -> bool {
 }
 
 @(private)
+release_record_locked :: proc(
+	queue: ^Queue,
+	record: ^Task_Record,
+) -> bool {
+	for candidate, index in queue.records {
+		if candidate != record {
+			continue
+		}
+		delete(record.task.label, queue.allocator)
+		free(record, queue.allocator)
+		ordered_remove(&queue.records, index)
+		return true
+	}
+	return false
+}
+
+@(private)
 remove_waiting_locked :: proc(queue: ^Queue, record: ^Task_Record) -> bool {
 	for queued, index in queue.waiting {
 		if queued == record {
@@ -480,6 +497,9 @@ request_cancel_locked :: proc(
 		}
 		emit_count_transitions_locked(queue, previous_waiting, previous_running)
 		sync.cond_broadcast(&queue.condition)
+		if record.task.release_on_finish {
+			_ = release_record_locked(queue, record)
+		}
 		return {}, true
 	}
 	if record.state != .Running {
@@ -554,15 +574,7 @@ finish_record_locked :: proc(
 	emit_count_transitions_locked(queue, previous_waiting, previous_running)
 	sync.cond_broadcast(&queue.condition)
 	if record.task.release_on_finish {
-		for candidate, index in queue.records {
-			if candidate != record {
-				continue
-			}
-			delete(record.task.label, queue.allocator)
-			free(record, queue.allocator)
-			ordered_remove(&queue.records, index)
-			break
-		}
+		_ = release_record_locked(queue, record)
 	}
 }
 
@@ -840,20 +852,30 @@ wake :: proc(queue: ^Queue) {
 	sync.mutex_unlock(&queue.mutex)
 }
 
-cancel :: proc(queue: ^Queue, id: Task_ID) -> bool {
+cancel_with_state :: proc(
+	queue: ^Queue,
+	id: Task_ID,
+) -> (Task_State, bool) {
 	if queue == nil {
-		return false
+		return .Unknown, false
 	}
 	call: Cancel_Call
 	changed := false
+	previous_state := Task_State.Unknown
 	sync.mutex_lock(&queue.mutex)
 	if record := find_record_locked(queue, id); record != nil {
+		previous_state = record.state
 		call, changed = request_cancel_locked(queue, record, false)
 	}
 	sync.mutex_unlock(&queue.mutex)
 	if call.procedure != nil {
 		call.procedure(call.data)
 	}
+	return previous_state, changed
+}
+
+cancel :: proc(queue: ^Queue, id: Task_ID) -> bool {
+	_, changed := cancel_with_state(queue, id)
 	return changed
 }
 
@@ -1107,14 +1129,11 @@ release :: proc(queue: ^Queue, id: Task_ID) -> bool {
 	}
 	sync.mutex_lock(&queue.mutex)
 	defer sync.mutex_unlock(&queue.mutex)
-	for record, index in queue.records {
+	for record in queue.records {
 		if record.id != id || !terminal_state(record.state) {
 			continue
 		}
-		delete(record.task.label, queue.allocator)
-		free(record, queue.allocator)
-		ordered_remove(&queue.records, index)
-		return true
+		return release_record_locked(queue, record)
 	}
 	return false
 }

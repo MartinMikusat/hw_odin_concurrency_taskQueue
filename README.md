@@ -30,6 +30,9 @@ The queue supports these operations:
 Cancellation and timeout requests are cooperative. A running task keeps its
 worker slot until its procedure returns. The optional cancellation procedure
 can terminate an owned subprocess or signal other task-specific work.
+`cancel_with_state` returns whether the task was waiting or running when the
+queue accepted the request. This lets an owner finalize task data that never
+entered a worker procedure.
 
 The queue retains terminal task records until `release` or `queue_destroy`.
 Set `release_on_finish` when the caller does not need `wait_task` or

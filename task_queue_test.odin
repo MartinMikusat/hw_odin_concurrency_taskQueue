@@ -257,6 +257,25 @@ waiting_auto_release_removes_cancelled_record_test :: proc(t: ^testing.T) {
 	testing.expect(t, !exists)
 }
 
+@(test)
+clear_auto_releases_waiting_records_test :: proc(t: ^testing.T) {
+	queue: Queue
+	testing.expect_value(
+		t,
+		queue_init(&queue, {concurrency = 1, start_paused = true}),
+		Init_Error.None,
+	)
+	defer queue_destroy(&queue)
+	id, add_error := add(&queue, {
+		procedure = recording_task,
+		release_on_finish = true,
+	})
+	testing.expect_value(t, add_error, Add_Error.None)
+	testing.expect_value(t, clear(&queue), 1)
+	_, exists := task_info(&queue, id)
+	testing.expect(t, !exists)
+}
+
 Queue_Class :: enum {
 	Download,
 	Export,

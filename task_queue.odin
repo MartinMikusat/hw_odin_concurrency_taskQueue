@@ -172,6 +172,7 @@ Task_Record :: struct {
 	cancel_requested:        bool,
 	timeout_requested:       bool,
 	cancel_callback_invoked: bool,
+	cancel_callback_pending: bool,
 	started_at:              time.Tick,
 	deadline:                time.Tick,
 }
@@ -180,6 +181,7 @@ Task_Record :: struct {
 Cancel_Call :: struct {
 	procedure: Cancel_Proc,
 	data:      rawptr,
+	record:    ^Task_Record,
 }
 
 Queue :: struct {
@@ -522,13 +524,27 @@ request_cancel_locked :: proc(
 	call: Cancel_Call
 	if !record.cancel_callback_invoked && record.task.cancel_procedure != nil {
 		record.cancel_callback_invoked = true
+		record.cancel_callback_pending = true
 		call = {
 			procedure = record.task.cancel_procedure,
 			data = record.task.data,
+			record = record,
 		}
 	}
 	sync.cond_broadcast(&queue.condition)
 	return call, true
+}
+
+@(private)
+invoke_cancel_call :: proc(queue: ^Queue, call: Cancel_Call) {
+	if call.procedure == nil {
+		return
+	}
+	call.procedure(call.data)
+	sync.mutex_lock(&queue.mutex)
+	call.record.cancel_callback_pending = false
+	sync.cond_broadcast(&queue.condition)
+	sync.mutex_unlock(&queue.mutex)
 }
 
 @(private)
@@ -649,6 +665,9 @@ worker_main :: proc(queue: ^Queue) {
 		outcome := record.task.procedure(&task_context)
 
 		sync.mutex_lock(&queue.mutex)
+		for record.cancel_callback_pending {
+			sync.cond_wait(&queue.condition, &queue.mutex)
+		}
 		finish_record_locked(queue, record, outcome)
 		sync.mutex_unlock(&queue.mutex)
 	}
@@ -686,7 +705,7 @@ watchdog_main :: proc(queue: ^Queue) {
 		)
 		sync.mutex_unlock(&queue.mutex)
 		for call in cancel_calls {
-			call.procedure(call.data)
+			invoke_cancel_call(queue, call)
 		}
 	}
 }
@@ -868,9 +887,7 @@ cancel_with_state :: proc(
 		call, changed = request_cancel_locked(queue, record, false)
 	}
 	sync.mutex_unlock(&queue.mutex)
-	if call.procedure != nil {
-		call.procedure(call.data)
-	}
+	invoke_cancel_call(queue, call)
 	return previous_state, changed
 }
 
@@ -883,6 +900,11 @@ clear :: proc(queue: ^Queue) -> int {
 	if queue == nil {
 		return 0
 	}
+	release_records := make(
+		[dynamic]^Task_Record,
+		context.temp_allocator,
+	)
+	defer delete(release_records)
 	sync.mutex_lock(&queue.mutex)
 	defer sync.mutex_unlock(&queue.mutex)
 	previous_waiting := len(queue.waiting)
@@ -892,8 +914,14 @@ clear :: proc(queue: ^Queue) -> int {
 		record.state = .Cancelled
 		emit_locked(queue, .Cancel_Requested, record)
 		emit_locked(queue, .Cancelled, record)
+		if record.task.release_on_finish {
+			append(&release_records, record)
+		}
 	}
 	resize(&queue.waiting, 0)
+	for record in release_records {
+		_ = release_record_locked(queue, record)
+	}
 	if previous_waiting > 0 {
 		emit_locked(queue, .Cleared)
 	}
@@ -1177,7 +1205,7 @@ queue_destroy :: proc(
 	sync.cond_broadcast(&queue.condition)
 	sync.mutex_unlock(&queue.mutex)
 	for call in cancel_calls {
-		call.procedure(call.data)
+		invoke_cancel_call(queue, call)
 	}
 	for worker in queue.workers {
 		thread.destroy(worker)

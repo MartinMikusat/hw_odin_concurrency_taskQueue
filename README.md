@@ -32,8 +32,10 @@ worker slot until its procedure returns. The optional cancellation procedure
 can terminate an owned subprocess or signal other task-specific work.
 
 The queue retains terminal task records until `release` or `queue_destroy`.
-The caller owns each task data pointer through that interval. The queue clones
-task labels, but it does not allocate or free task data.
+Set `release_on_finish` when the caller does not need `wait_task` or
+`task_info` after completion. The caller owns each task data pointer until the
+terminal record is released. The queue clones task labels, but it does not
+allocate or free task data.
 
 Keep the `Queue` at one stable memory address until `queue_destroy` returns.
 The custom policy procedures execute while the queue mutex is locked. They

@@ -35,6 +35,7 @@ Task :: struct {
 	policy_data:      rawptr,
 	timeout:          time.Duration,
 	override_timeout: bool,
+	release_on_finish: bool,
 	label:            string,
 }
 
@@ -552,6 +553,17 @@ finish_record_locked :: proc(
 	}
 	emit_count_transitions_locked(queue, previous_waiting, previous_running)
 	sync.cond_broadcast(&queue.condition)
+	if record.task.release_on_finish {
+		for candidate, index in queue.records {
+			if candidate != record {
+				continue
+			}
+			delete(record.task.label, queue.allocator)
+			free(record, queue.allocator)
+			ordered_remove(&queue.records, index)
+			break
+		}
+	}
 }
 
 @(private)

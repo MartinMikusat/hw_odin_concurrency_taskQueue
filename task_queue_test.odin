@@ -13,6 +13,7 @@ Test_State :: struct {
 	active:      int,
 	max_active:  int,
 	cancelled:   bool,
+	finalized:   bool,
 	release:     bool,
 }
 
@@ -61,6 +62,13 @@ cancel_blocking :: proc(pointer: rawptr) {
 	data := (^Test_Data)(pointer)
 	sync.mutex_lock(&data.state.mutex)
 	data.state.cancelled = true
+	sync.mutex_unlock(&data.state.mutex)
+}
+
+finalize_recording :: proc(pointer: rawptr) {
+	data := (^Test_Data)(pointer)
+	sync.mutex_lock(&data.state.mutex)
+	data.state.finalized = true
 	sync.mutex_unlock(&data.state.mutex)
 }
 
@@ -272,6 +280,32 @@ clear_auto_releases_waiting_records_test :: proc(t: ^testing.T) {
 	})
 	testing.expect_value(t, add_error, Add_Error.None)
 	testing.expect_value(t, clear(&queue), 1)
+	_, exists := task_info(&queue, id)
+	testing.expect(t, !exists)
+}
+
+@(test)
+finalizer_runs_before_idle_and_auto_release_test :: proc(t: ^testing.T) {
+	state: Test_State
+	state_init(&state)
+	defer state_destroy(&state)
+	queue: Queue
+	testing.expect_value(
+		t,
+		queue_init(&queue, {concurrency = 1}),
+		Init_Error.None,
+	)
+	defer queue_destroy(&queue)
+	data := Test_Data{state = &state}
+	id, add_error := add(&queue, {
+		procedure = recording_task,
+		data = &data,
+		finalize_procedure = finalize_recording,
+		release_on_finish = true,
+	})
+	testing.expect_value(t, add_error, Add_Error.None)
+	testing.expect(t, wait_until(&queue, .Idle, timeout = time.Second))
+	testing.expect(t, state.finalized)
 	_, exists := task_info(&queue, id)
 	testing.expect(t, !exists)
 }

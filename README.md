@@ -34,6 +34,12 @@ can terminate an owned subprocess or signal other task-specific work.
 queue accepted the request. This lets an owner finalize task data that never
 entered a worker procedure.
 
+The optional finalization procedure runs after an entered task procedure
+returns and before the queue publishes its terminal state or releases its
+worker slot. Use it to free task data after a background result has been
+committed. A task cancelled while waiting does not run its finalization
+procedure because its task procedure never acquired ownership.
+
 The queue retains terminal task records until `release` or `queue_destroy`.
 Set `release_on_finish` when the caller does not need `wait_task` or
 `task_info` after completion. The caller owns each task data pointer until the
@@ -88,7 +94,8 @@ Run:
 ```
 
 The tests cover concurrency, priority, pause and resume, cancellation, timeout,
-strict rate limiting, events, record release, and a custom resource policy.
+strict rate limiting, events, finalization, record release, and a custom
+resource policy.
 
 ## License
 

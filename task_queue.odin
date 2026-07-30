@@ -25,12 +25,14 @@ Task_Outcome :: struct {
 
 Task_Proc :: #type proc(task_context: ^Task_Context) -> Task_Outcome
 Cancel_Proc :: #type proc(data: rawptr)
+Finalize_Proc :: #type proc(data: rawptr)
 Clock_Proc :: #type proc(data: rawptr) -> time.Tick
 
 Task :: struct {
 	procedure:        Task_Proc,
 	data:             rawptr,
 	cancel_procedure: Cancel_Proc,
+	finalize_procedure: Finalize_Proc,
 	priority:         int,
 	policy_data:      rawptr,
 	timeout:          time.Duration,
@@ -173,6 +175,7 @@ Task_Record :: struct {
 	timeout_requested:       bool,
 	cancel_callback_invoked: bool,
 	cancel_callback_pending: bool,
+	finishing:                bool,
 	started_at:              time.Tick,
 	deadline:                time.Tick,
 }
@@ -482,6 +485,9 @@ request_cancel_locked :: proc(
 	if terminal_state(record.state) {
 		return {}, false
 	}
+	if record.finishing {
+		return {}, false
+	}
 	if record.state == .Waiting {
 		previous_waiting := len(queue.waiting)
 		previous_running := queue.running_count
@@ -668,6 +674,14 @@ worker_main :: proc(queue: ^Queue) {
 		for record.cancel_callback_pending {
 			sync.cond_wait(&queue.condition, &queue.mutex)
 		}
+		record.finishing = true
+		finalize_procedure := record.task.finalize_procedure
+		finalize_data := record.task.data
+		sync.mutex_unlock(&queue.mutex)
+		if finalize_procedure != nil {
+			finalize_procedure(finalize_data)
+		}
+		sync.mutex_lock(&queue.mutex)
 		finish_record_locked(queue, record, outcome)
 		sync.mutex_unlock(&queue.mutex)
 	}

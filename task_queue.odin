@@ -699,12 +699,14 @@ watchdog_main :: proc(queue: ^Queue) {
 			return
 		}
 		now := now_locked(queue)
+		has_deadline := false
 		for record in queue.records {
 			if record.state != .Running ||
 			   record.deadline._nsec == 0 ||
 			   record.timeout_requested {
 				continue
 			}
+			has_deadline = true
 			if time.tick_diff(record.deadline, now) >= 0 {
 				if call, changed := request_cancel_locked(queue, record, true); changed &&
 				   call.procedure != nil {
@@ -712,11 +714,15 @@ watchdog_main :: proc(queue: ^Queue) {
 				}
 			}
 		}
-		_ = sync.cond_wait_with_timeout(
-			&queue.condition,
-			&queue.mutex,
-			10 * time.Millisecond,
-		)
+		// Untimed work and an idle queue need no watchdog ticks. Task starts,
+		// completions and shutdown all signal this condition.
+		if len(cancel_calls) == 0 {
+			if has_deadline {
+				_ = sync.cond_wait_with_timeout(&queue.condition, &queue.mutex, 10 * time.Millisecond)
+			} else {
+				sync.cond_wait(&queue.condition, &queue.mutex)
+			}
+		}
 		sync.mutex_unlock(&queue.mutex)
 		for call in cancel_calls {
 			invoke_cancel_call(queue, call)

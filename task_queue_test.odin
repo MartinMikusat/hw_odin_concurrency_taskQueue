@@ -399,3 +399,29 @@ custom_policy_selects_eligible_tasks_test :: proc(t: ^testing.T) {
 }
 
 _ :: intrinsics
+
+Clock_Count :: struct {mutex: sync.Mutex, calls: int}
+counting_clock :: proc(pointer: rawptr) -> time.Tick {
+	count := (^Clock_Count)(pointer)
+	sync.mutex_lock(&count.mutex)
+	count.calls += 1
+	sync.mutex_unlock(&count.mutex)
+	return time.tick_now()
+}
+
+@(test)
+idle_watchdog_sleeps_test :: proc(t: ^testing.T) {
+	count: Clock_Count
+	queue: Queue
+	testing.expect_value(t, queue_init(&queue, {concurrency = 2, clock_procedure = counting_clock, clock_data = &count}), Init_Error.None)
+	defer queue_destroy(&queue)
+	time.sleep(30 * time.Millisecond)
+	sync.mutex_lock(&count.mutex)
+	before := count.calls
+	sync.mutex_unlock(&count.mutex)
+	time.sleep(60 * time.Millisecond)
+	sync.mutex_lock(&count.mutex)
+	after := count.calls
+	sync.mutex_unlock(&count.mutex)
+	testing.expect(t, after - before <= 1, "idle watchdog must not poll the clock every 10 ms")
+}

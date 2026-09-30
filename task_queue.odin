@@ -60,6 +60,7 @@ Task_Info :: struct {
 }
 
 Queue_Snapshot :: struct {
+	dropped_events: u64,
 	waiting:     int,
 	running:     int,
 	terminal:    int,
@@ -118,6 +119,7 @@ Init_Error :: enum {
 	Invalid_Concurrency,
 	Invalid_Rate_Limit,
 	Thread_Creation_Failed,
+	Allocation_Failed,
 }
 
 Add_Error :: enum {
@@ -175,6 +177,7 @@ Task_Record :: struct {
 	timeout_requested:       bool,
 	cancel_callback_invoked: bool,
 	cancel_callback_pending: bool,
+	cancel_next:             ^Task_Record,
 	finishing:                bool,
 	started_at:              time.Tick,
 	deadline:                time.Tick,
@@ -195,6 +198,8 @@ Queue :: struct {
 	waiting:                   [dynamic]^Task_Record,
 	events:                    [dynamic]Task_Event,
 	event_offset:              int,
+	dropped_events:            u64,
+	policy_items:              [dynamic]Policy_Item,
 	workers:                   [dynamic]^thread.Thread,
 	watchdog:                  ^thread.Thread,
 	next_id:                   u64,
@@ -252,6 +257,7 @@ snapshot_locked :: proc(queue: ^Queue) -> Queue_Snapshot {
 		waiting = len(queue.waiting),
 		running = queue.running_count,
 		terminal = terminal,
+		dropped_events = queue.dropped_events,
 		concurrency = queue.concurrency,
 		paused = queue.paused,
 	}
@@ -281,7 +287,9 @@ emit_locked :: proc(
 		event.state = record.state
 		event.code = record.outcome.code
 	}
-	append(&queue.events, event)
+	if _, error := append(&queue.events, event); error != nil {
+		queue.dropped_events = min(queue.dropped_events, max(u64) - 1) + 1
+	}
 }
 
 @(private)
@@ -433,6 +441,7 @@ record_rate_start_locked :: proc(queue: ^Queue, now: time.Tick) {
 		return
 	}
 	if queue.strict_rate_limit {
+		assert(len(queue.strict_start_ticks) < cap(queue.strict_start_ticks))
 		append(&queue.strict_start_ticks, now)
 	} else {
 		reset_fixed_window_locked(queue, now)
@@ -460,8 +469,9 @@ select_waiting_index_locked :: proc(queue: ^Queue) -> int {
 	if queue.policy.select_procedure == nil {
 		return default_waiting_index_locked(queue)
 	}
-	items := make([]Policy_Item, len(queue.waiting), context.temp_allocator)
-	defer delete(items, context.temp_allocator)
+	assert(len(queue.waiting) <= cap(queue.policy_items))
+	resize(&queue.policy_items, len(queue.waiting))
+	items := queue.policy_items[:]
 	for record, index in queue.waiting {
 		items[index] = policy_item(record)
 	}
@@ -551,6 +561,28 @@ invoke_cancel_call :: proc(queue: ^Queue, call: Cancel_Call) {
 	call.record.cancel_callback_pending = false
 	sync.cond_broadcast(&queue.condition)
 	sync.mutex_unlock(&queue.mutex)
+}
+
+@(private)
+append_cancel_call :: proc(head, tail: ^^Task_Record, call: Cancel_Call) {
+	if tail^ == nil {
+		head^ = call.record
+	} else {
+		tail^.cancel_next = call.record
+	}
+	tail^ = call.record
+}
+
+// Pending cancellation pins each record until its callback returns.
+@(private)
+invoke_cancel_chain :: proc(queue: ^Queue, record: ^Task_Record) {
+	record := record
+	for record != nil {
+		next := record.cancel_next
+		record.cancel_next = nil
+		invoke_cancel_call(queue, {record.task.cancel_procedure, record.task.data, record})
+		record = next
+	}
 }
 
 @(private)
@@ -689,10 +721,8 @@ worker_main :: proc(queue: ^Queue) {
 
 @(private)
 watchdog_main :: proc(queue: ^Queue) {
-	cancel_calls := make([dynamic]Cancel_Call, context.temp_allocator)
-	defer delete(cancel_calls)
 	for {
-		resize(&cancel_calls, 0)
+		cancel_head, cancel_tail: ^Task_Record
 		sync.mutex_lock(&queue.mutex)
 		if queue.stopping && queue.running_count == 0 {
 			sync.mutex_unlock(&queue.mutex)
@@ -710,13 +740,13 @@ watchdog_main :: proc(queue: ^Queue) {
 			if time.tick_diff(record.deadline, now) >= 0 {
 				if call, changed := request_cancel_locked(queue, record, true); changed &&
 				   call.procedure != nil {
-					append(&cancel_calls, call)
+					append_cancel_call(&cancel_head, &cancel_tail, call)
 				}
 			}
 		}
 		// Untimed work and an idle queue need no watchdog ticks. Task starts,
 		// completions and shutdown all signal this condition.
-		if len(cancel_calls) == 0 {
+		if cancel_head == nil {
 			if has_deadline {
 				_ = sync.cond_wait_with_timeout(&queue.condition, &queue.mutex, 10 * time.Millisecond)
 			} else {
@@ -724,14 +754,15 @@ watchdog_main :: proc(queue: ^Queue) {
 			}
 		}
 		sync.mutex_unlock(&queue.mutex)
-		for call in cancel_calls {
-			invoke_cancel_call(queue, call)
-		}
+		invoke_cancel_chain(queue, cancel_head)
 	}
 }
 
 @(private)
 spawn_worker_locked :: proc(queue: ^Queue) -> bool {
+	if reserve(&queue.workers, len(queue.workers) + 1) != nil {
+		return false
+	}
 	worker := thread.create_and_start_with_poly_data(queue, worker_main)
 	if worker == nil {
 		return false
@@ -777,37 +808,21 @@ queue_init :: proc(queue: ^Queue, options: Queue_Options) -> Init_Error {
 	queue.events = make([dynamic]Task_Event, allocator)
 	queue.workers = make([dynamic]^thread.Thread, allocator)
 	queue.strict_start_ticks = make([dynamic]time.Tick, allocator)
+	queue.policy_items = make([dynamic]Policy_Item, allocator)
+	if reserve(&queue.workers, options.concurrency) != nil ||
+	   options.strict_rate_limit && reserve(&queue.strict_start_ticks, options.interval_cap) != nil {
+		queue_destroy(queue)
+		return .Allocation_Failed
+	}
 	for _ in 0 ..< options.concurrency {
 		if !spawn_worker_locked(queue) {
-			queue.stopping = true
-			queue.shutdown_mode = .Cancel_All
-			sync.cond_broadcast(&queue.condition)
-			for worker in queue.workers {
-				thread.destroy(worker)
-			}
-			delete(queue.records)
-			delete(queue.waiting)
-			delete(queue.events)
-			delete(queue.workers)
-			delete(queue.strict_start_ticks)
-			queue^ = {}
+			queue_destroy(queue)
 			return .Thread_Creation_Failed
 		}
 	}
 	queue.watchdog = thread.create_and_start_with_poly_data(queue, watchdog_main)
 	if queue.watchdog == nil {
-		queue.stopping = true
-		queue.shutdown_mode = .Cancel_All
-		sync.cond_broadcast(&queue.condition)
-		for worker in queue.workers {
-			thread.destroy(worker)
-		}
-		delete(queue.records)
-		delete(queue.waiting)
-		delete(queue.events)
-		delete(queue.workers)
-		delete(queue.strict_start_ticks)
-		queue^ = {}
+		queue_destroy(queue)
 		return .Thread_Creation_Failed
 	}
 	return .None
@@ -822,8 +837,16 @@ add :: proc(queue: ^Queue, task: Task) -> (Task_ID, Add_Error) {
 	if queue.stopping {
 		return 0, .Queue_Stopping
 	}
+	if len(queue.records) == max(int) || len(queue.waiting) == max(int) ||
+	   reserve(&queue.records, len(queue.records) + 1) != nil ||
+	   reserve(&queue.waiting, len(queue.waiting) + 1) != nil ||
+	   queue.policy.select_procedure != nil && reserve(&queue.policy_items, len(queue.waiting) + 1) != nil {
+		return 0, .Allocation_Failed
+	}
+	assert(queue.next_id < max(u64))
+	assert(queue.next_sequence < max(u64))
 	record, allocation_error := new(Task_Record, queue.allocator)
-	if allocation_error != nil {
+	if allocation_error != nil || record == nil {
 		return 0, .Allocation_Failed
 	}
 	record^ = {
@@ -833,7 +856,12 @@ add :: proc(queue: ^Queue, task: Task) -> (Task_ID, Add_Error) {
 		state = .Waiting,
 	}
 	if len(task.label) > 0 {
-		record.task.label = strings.clone(task.label, queue.allocator)
+		label, error := strings.clone(task.label, queue.allocator)
+		if error != nil {
+			free(record, queue.allocator)
+			return 0, .Allocation_Failed
+		}
+		record.task.label = label
 	}
 	queue.next_id += 1
 	queue.next_sequence += 1
@@ -850,6 +878,9 @@ add_all :: proc(
 	tasks: []Task,
 	ids: ^[dynamic]Task_ID,
 ) -> Add_Error {
+	if ids != nil && (len(tasks) > max(int) - len(ids^) || reserve(ids, len(ids^) + len(tasks)) != nil) {
+		return .Allocation_Failed
+	}
 	for task in tasks {
 		id, add_error := add(queue, task)
 		if add_error != .None {
@@ -920,11 +951,6 @@ clear :: proc(queue: ^Queue) -> int {
 	if queue == nil {
 		return 0
 	}
-	release_records := make(
-		[dynamic]^Task_Record,
-		context.temp_allocator,
-	)
-	defer delete(release_records)
 	sync.mutex_lock(&queue.mutex)
 	defer sync.mutex_unlock(&queue.mutex)
 	previous_waiting := len(queue.waiting)
@@ -935,13 +961,10 @@ clear :: proc(queue: ^Queue) -> int {
 		emit_locked(queue, .Cancel_Requested, record)
 		emit_locked(queue, .Cancelled, record)
 		if record.task.release_on_finish {
-			append(&release_records, record)
+			_ = release_record_locked(queue, record)
 		}
 	}
 	resize(&queue.waiting, 0)
-	for record in release_records {
-		_ = release_record_locked(queue, record)
-	}
 	if previous_waiting > 0 {
 		emit_locked(queue, .Cleared)
 	}
@@ -1026,12 +1049,15 @@ task_info :: proc(queue: ^Queue, id: Task_ID) -> (Task_Info, bool) {
 running_tasks :: proc(
 	queue: ^Queue,
 	destination: ^[dynamic]Task_Info,
-) {
+) -> bool {
 	if queue == nil || destination == nil {
-		return
+		return false
 	}
 	sync.mutex_lock(&queue.mutex)
 	defer sync.mutex_unlock(&queue.mutex)
+	if reserve(destination, queue.running_count) != nil {
+		return false
+	}
 	resize(destination, 0)
 	for record in queue.records {
 		if record.state != .Running {
@@ -1047,6 +1073,7 @@ running_tasks :: proc(
 			label = record.task.label,
 		})
 	}
+	return true
 }
 
 poll_event :: proc(queue: ^Queue) -> (Task_Event, bool) {
@@ -1193,8 +1220,7 @@ queue_destroy :: proc(
 	if queue == nil || queue.allocator.procedure == nil {
 		return
 	}
-	cancel_calls := make([dynamic]Cancel_Call, context.temp_allocator)
-	defer delete(cancel_calls)
+	cancel_head, cancel_tail: ^Task_Record
 	sync.mutex_lock(&queue.mutex)
 	queue.stopping = true
 	queue.paused = false
@@ -1218,15 +1244,13 @@ queue_destroy :: proc(
 			}
 			if call, changed := request_cancel_locked(queue, record, false); changed &&
 			   call.procedure != nil {
-				append(&cancel_calls, call)
+				append_cancel_call(&cancel_head, &cancel_tail, call)
 			}
 		}
 	}
 	sync.cond_broadcast(&queue.condition)
 	sync.mutex_unlock(&queue.mutex)
-	for call in cancel_calls {
-		invoke_cancel_call(queue, call)
-	}
+	invoke_cancel_chain(queue, cancel_head)
 	for worker in queue.workers {
 		thread.destroy(worker)
 	}
@@ -1242,5 +1266,6 @@ queue_destroy :: proc(
 	delete(queue.events)
 	delete(queue.workers)
 	delete(queue.strict_start_ticks)
+	delete(queue.policy_items)
 	queue^ = {}
 }

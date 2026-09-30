@@ -1,13 +1,7 @@
 # hw_odin_concurrency_taskQueue
 
-An in-memory task queue for Odin applications that need bounded background
+An in-memory task queue for Odin applications that need concurrent background
 work, priorities, cooperative cancellation, timeouts, and rate limits.
-
-## AI-assisted development disclosure
-
-Models used:
-
-- **gpt-5.6-sol**
 
 ## Behavior
 
@@ -49,6 +43,16 @@ allocate or free task data.
 Keep the `Queue` at one stable memory address until `queue_destroy` returns.
 The custom policy procedures execute while the queue mutex is locked. They
 must not block or call queue operations.
+
+Waiting tasks, retained records and events grow with submissions. Callers bound
+submission bursts, drain events and release terminal records. `snapshot` reports
+`dropped_events`, a saturating lifetime count of event allocation failures.
+Tasks continue when events are lost; use task state and wait operations for
+completion guarantees. Submission allocation failure returns `.Allocation_Failed`
+before publishing the task. `running_tasks` returns false on output allocation
+failure and preserves its destination. Labels returned by `task_info`,
+`wait_task` and `running_tasks` borrow their records until `release`, automatic
+release or queue destruction; do not retain them across concurrent release.
 
 ## Example
 

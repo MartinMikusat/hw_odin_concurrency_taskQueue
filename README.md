@@ -9,6 +9,11 @@ The queue owns a fixed set of worker threads. `add` appends a task and returns
 a stable identifier. The scheduler starts the highest-priority eligible task
 when a worker slot and a rate-limit slot are available.
 
+A worker runs tasks in the default context plus the assertion handler of the
+context that called `queue_init`, so a crash hook installed there also covers
+tasks. A task that assigns `context` replaces that context and sets its own
+handler.
+
 The queue supports these operations:
 
 - Set the concurrency while the queue runs.

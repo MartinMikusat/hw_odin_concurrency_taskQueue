@@ -1,5 +1,6 @@
 package task_queue
 
+import "base:runtime"
 import "core:mem"
 import "core:strings"
 import "core:sync"
@@ -221,6 +222,7 @@ Queue :: struct {
 	clock_procedure:           Clock_Proc,
 	clock_data:                rawptr,
 	policy:                    Policy,
+	assertion_failure_proc:    runtime.Assertion_Failure_Proc,
 }
 
 @(private)
@@ -634,6 +636,7 @@ finish_record_locked :: proc(
 
 @(private)
 worker_main :: proc(queue: ^Queue) {
+	context.assertion_failure_proc = queue.assertion_failure_proc
 	for {
 		sync.mutex_lock(&queue.mutex)
 		record: ^Task_Record
@@ -721,6 +724,7 @@ worker_main :: proc(queue: ^Queue) {
 
 @(private)
 watchdog_main :: proc(queue: ^Queue) {
+	context.assertion_failure_proc = queue.assertion_failure_proc
 	for {
 		cancel_head, cancel_tail: ^Task_Record
 		sync.mutex_lock(&queue.mutex)
@@ -802,6 +806,7 @@ queue_init :: proc(queue: ^Queue, options: Queue_Options) -> Init_Error {
 		clock_procedure = clock,
 		clock_data = options.clock_data,
 		policy = options.policy,
+		assertion_failure_proc = context.assertion_failure_proc,
 	}
 	queue.records = make([dynamic]^Task_Record, allocator)
 	queue.waiting = make([dynamic]^Task_Record, allocator)
